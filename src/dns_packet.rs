@@ -1,13 +1,34 @@
 use bitvec::prelude::*;
+use std::convert::TryInto;
+use std::error;
+use std::fmt;
 
 #[derive(Debug)]
 pub enum DnsParseError {
     // Max length and length of given data
     DataExceedMaxLen(usize, usize),
-    UndefinedMessageType,
+    UndefinedRecordType(u16),
+    StreamFormatError,
 }
 
-#[derive(Clone, Copy)]
+impl fmt::Display for DnsParseError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match *self {
+            DnsParseError::DataExceedMaxLen(max_len, len) => write!(
+                f,
+                "Data exceed max length of the field ({}/{})",
+                len, max_len
+            ),
+            DnsParseError::UndefinedRecordType(num) => write!(f, "Undefined record type / record class: {}", num),
+            DnsParseError::StreamFormatError => write!(f, "Wrong format in DNS packet"),
+        }
+    }
+}
+
+impl error::Error for DnsParseError {
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum RecordType {
     A,
 }
@@ -21,9 +42,22 @@ impl RecordType {
     pub fn serialize<T: BitStore>(self, target_bv: &mut BitVec<T, Msb0>) {
         target_bv.extend_from_bitslice(self.value().view_bits::<Msb0>());
     }
+    fn deserialize<'a, I>(&mut self, mut iter: I) -> Result<(), DnsParseError>
+    where
+        I: Iterator<Item = &'a u8>,
+    {
+        let bytes: [u8; 2] = [*iter.next().unwrap(), *iter.next().unwrap()];
+        match u16::from_be_bytes(bytes) {
+            1 => {
+                *self = Self::A;
+                Ok(())
+            }
+            n => Err(DnsParseError::UndefinedRecordType(n)),
+        }
+    }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecordClass {
     IN,
 
@@ -42,6 +76,23 @@ impl RecordClass {
     fn serialize<T: BitStore>(self, target_bv: &mut BitVec<T, Msb0>) {
         target_bv.extend_from_bitslice(self.value().view_bits::<Msb0>());
     }
+    fn deserialize<'a, I>(&mut self, mut iter: I) -> Result<(), DnsParseError>
+    where
+        I: Iterator<Item = &'a u8>,
+    {
+        let bytes: [u8; 2] = [*iter.next().unwrap(), *iter.next().unwrap()];
+        match u16::from_be_bytes(bytes) {
+            1 => {
+                *self = Self::IN;
+                Ok(())
+            }
+            255 => {
+                *self = Self::ALL;
+                Ok(())
+            }
+            n => Err(DnsParseError::UndefinedRecordType(n)),
+        }
+    }
 }
 
 impl TryFrom<u16> for RecordClass {
@@ -52,10 +103,11 @@ impl TryFrom<u16> for RecordClass {
 
             255 => Ok(RecordClass::ALL),
 
-            _ => Err(DnsParseError::UndefinedMessageType),
+            n => Err(DnsParseError::UndefinedRecordType(n)),
         }
     }
 }
+#[derive(Debug, PartialEq, Eq)]
 pub enum DnsName {
     Str(Vec<String>),
     // Pointer to name label already in buffer.
@@ -85,6 +137,28 @@ impl DnsName {
             }
         };
     }
+    fn deserialize<'a, I>(&mut self, mut iter: I) -> Result<(), DnsParseError>
+    where
+        I: Iterator<Item = &'a u8>,
+    {
+        loop {
+            let count: usize = match iter.next() {
+                Some(0) => {
+                    break;
+                }
+                Some(&val) => val as usize,
+                None => {
+                    return Err(DnsParseError::StreamFormatError);
+                }
+            };
+            let s = String::from_iter((&mut iter).take(count).map(|&ch| ch as char));
+            match self {
+                Self::Str(v) => v.push(s),
+                Self::Offset(_) => return Err(DnsParseError::StreamFormatError),
+            }
+        }
+        Ok(())
+    }
 }
 
 impl TryFrom<&String> for DnsName {
@@ -92,9 +166,8 @@ impl TryFrom<&String> for DnsName {
     fn try_from(value: &String) -> Result<Self, Self::Error> {
         // TODO: Check length error
         Ok(DnsName::Str(
-            value.split('.')
-                 .map(|str| String::from(str))
-                 .collect()))
+            value.split('.').map(|str| String::from(str)).collect(),
+        ))
     }
 }
 
@@ -102,13 +175,12 @@ impl FromStr for DnsName {
     type Err = DnsParseError;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         Ok(DnsName::Str(
-            s.split('.')
-             .map(|str| String::from(str))
-             .collect()))
+            s.split('.').map(|str| String::from(str)).collect(),
+        ))
     }
 }
 
-#[derive(Default)]
+#[derive(Default, Debug, PartialEq, Eq)]
 struct Header {
     id: u16,
     flags: u16,
@@ -127,8 +199,35 @@ impl Header {
         target_bv.extend_from_bitslice(self.authorities_count.view_bits::<Msb0>());
         target_bv.extend_from_bitslice(self.additional_count.view_bits::<Msb0>());
     }
+
+    pub fn deserialize<'a, I>(&mut self, mut iter: I) -> Result<(), DnsParseError>
+    where
+        I: Iterator<Item = &'a u8>,
+    {
+        let to_modify = [
+            &mut self.id,
+            &mut self.flags,
+            &mut self.questions_count,
+            &mut self.answers_count,
+            &mut self.authorities_count,
+            &mut self.additional_count,
+        ];
+        for member in to_modify {
+            *member = u16::from_be_bytes(
+                (&mut iter)
+                    .take(2)
+                    .cloned()
+                    .collect::<Vec<u8>>()
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| DnsParseError::StreamFormatError)?,
+            );
+        }
+        Ok(())
+    }
 }
 
+#[derive(Debug, PartialEq, Eq)]
 struct Question {
     qname: DnsName,
     qtype: RecordType,
@@ -136,13 +235,31 @@ struct Question {
 }
 
 impl Question {
+    fn new() -> Self {
+        Question {
+            qname: DnsName::Str(vec![]),
+            qtype: RecordType::A,
+            qclass: RecordClass::ALL,
+        }
+    }
     pub fn serialize<T: BitStore>(&self, target_bv: &mut BitVec<T, Msb0>) {
         self.qname.serialize(target_bv);
         self.qtype.serialize(target_bv);
         self.qclass.serialize(target_bv);
     }
+
+    pub fn deserialize<'a, I>(&mut self, mut iter: I) -> Result<(), DnsParseError>
+    where
+        I: Iterator<Item = &'a u8>,
+    {
+        self.qname.deserialize(&mut iter)?;
+        self.qtype.deserialize(&mut iter)?;
+        self.qclass.deserialize(&mut iter)?;
+        Ok(())
+    }
 }
 
+#[derive(Debug, PartialEq, Eq)]
 struct Record {
     rname: DnsName,
     rtype: RecordType,
@@ -153,6 +270,17 @@ struct Record {
 }
 
 impl Record {
+    fn new() -> Self {
+        Self {
+            rname: DnsName::Str(vec![]),
+            rtype: RecordType::A,
+            rclass: RecordClass::IN,
+            ttl: 0,
+            data_length: 0,
+            data: BitVec::new(),
+        }
+    }
+
     pub fn serialize<T: BitStore>(&self, target_bv: &mut BitVec<T, Msb0>) {
         self.rname.serialize(target_bv);
         self.rtype.serialize(target_bv);
@@ -161,9 +289,42 @@ impl Record {
         target_bv.extend_from_bitslice(self.data_length.view_bits::<Msb0>());
         target_bv.extend_from_bitslice(&self.data);
     }
+
+    fn deserialize<'a, I>(&mut self, mut iter: I) -> Result<(), DnsParseError>
+    where
+        I: Iterator<Item = &'a u8>,
+    {
+        self.rname.deserialize(&mut iter)?;
+        self.rtype.deserialize(&mut iter)?;
+        self.rclass.deserialize(&mut iter)?;
+        self.ttl = u32::from_be_bytes(
+            (&mut iter)
+                .take(4)
+                .cloned()
+                .collect::<Vec<u8>>()
+                .as_slice()
+                .try_into()
+                .map_err(|_| DnsParseError::StreamFormatError)?,
+        );
+        self.data_length = u16::from_be_bytes(
+            (&mut iter)
+                .take(2)
+                .cloned()
+                .collect::<Vec<u8>>()
+                .as_slice()
+                .try_into()
+                .map_err(|_| DnsParseError::StreamFormatError)?,
+        );
+        self.data = (&mut iter).take(self.data_length as usize).collect();
+        if self.data.len() != self.data_length as usize {
+            return Err(DnsParseError::StreamFormatError);
+        }
+        Ok(())
+    }
 }
 
-pub struct Message {
+#[derive(PartialEq, Eq, Debug)]
+pub struct Packet {
     header: Header,
 
     questions: Vec<Question>,
@@ -175,9 +336,9 @@ pub struct Message {
     additional: Vec<Record>,
 }
 
-impl Message {
+impl Packet {
     pub fn new() -> Self {
-        Message {
+        Packet {
             header: Default::default(),
             questions: Vec::new(),
             answers: Vec::new(),
@@ -193,7 +354,7 @@ impl Message {
             Err(_) => Err(DnsParseError::DataExceedMaxLen(std::u16::MAX as usize, x)),
         };
         self.header.id = id;
-        self.header.questions_count = try_usize_to_u16(self.questions.len())?; 
+        self.header.questions_count = try_usize_to_u16(self.questions.len())?;
         self.header.answers_count = try_usize_to_u16(self.answers.len())?;
         self.header.authorities_count = try_usize_to_u16(self.authorities.len())?;
         self.header.additional_count = try_usize_to_u16(self.additional.len())?;
@@ -213,50 +374,74 @@ impl Message {
         Ok(buf)
     }
 
+    pub fn deserialize<'a, I>(&mut self, mut iter: I) -> Result<(), DnsParseError>
+    where
+        I: Iterator<Item = &'a u8>,
+    {
+        let to_modify = [
+            (self.header.answers_count, &mut self.answers),
+            (self.header.answers_count, &mut self.authorities),
+            (self.header.answers_count, &mut self.additional),
+        ];
+        self.header.deserialize(&mut iter)?;
+        for _ in 0..self.header.questions_count {
+            let mut q = Question::new();
+            q.deserialize(&mut iter)?;
+            self.questions.push(q);
+        }
+        for (count, modify) in to_modify {
+            for _ in 0..count {
+                let mut a = Record::new();
+                a.deserialize(&mut iter)?;
+                modify.push(a);
+            }
+        }
+        Ok(())
+    }
 }
 
-impl Default for Message {
+impl Default for Packet {
     fn default() -> Self {
         Self::new()
     }
 }
 
-use std::borrow::BorrowMut;
-use std::collections::hash_map::DefaultHasher;
+// Tests
 use std::net::{SocketAddrV4, UdpSocket};
 use std::str::FromStr;
 
 #[test]
-fn check_buffer_bit_order() -> std::io::Result<()> {
+fn check_request() -> Result<(), Box<dyn error::Error>> {
     let socket = UdpSocket::bind("127.0.0.1:34254")?;
-    let mut m = Message {
-        questions: vec![ Question {
+    let mut p = Packet {
+        questions: vec![Question {
             qname: DnsName::from_str("abc.xyz.com").unwrap(),
             qtype: RecordType::A,
-            qclass: RecordClass::IN
+            qclass: RecordClass::IN,
         }],
         ..Default::default()
     };
-    let buf: BitVec<u8, Msb0> = m.serialize(1).unwrap();
-    assert_eq!(buf.len(), 232);
-    assert_eq!(&buf.as_raw_slice()[12..25], [
-        0b11,
-        0b1100001,
-        0b1100010,
-        0b1100011,
-        0b11,
-        0b1111000,
-        0b1111001,
-        0b1111010,
-        0b11,
-        0b1100011,
-        0b1101111,
-        0b1101101,
-        0b0
-    ]);
+    let binding = p.serialize(1).unwrap();
+    let buf = binding.as_raw_slice();
+    assert_eq!(binding.len(), 232);
+    assert_eq!(
+        &buf[12..25],
+        [
+            0b11, 0b1100001, 0b1100010, 0b1100011, 0b11, 0b1111000, 0b1111001, 0b1111010, 0b11,
+            0b1100011, 0b1101111, 0b1101101, 0b0
+        ]
+    );
 
     // let dest = SocketAddrV4::from_str("127.0.0.1:53").unwrap();
     // socket.send_to(buf.as_raw_slice(), dest)?;
+    let mut p_check = Packet::new();
+    p_check.deserialize(buf.iter())?;
+    assert_eq!(p_check, p);
+    Ok(())
+}
+
+#[test]
+fn check_response() -> Result<(), Box<dyn error::Error>> {
 
     Ok(())
 }
