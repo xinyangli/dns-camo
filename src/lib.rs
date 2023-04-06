@@ -1,1 +1,2 @@
-pub mod dns_message;
+pub mod dns_packet;
+pub mod payload;

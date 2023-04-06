@@ -1,7 +1,12 @@
+use crate::payload::Payload;
 use bitvec::prelude::*;
+use data_encoding::BASE32_DNSSEC;
+use std::collections::btree_map::Iter;
 use std::convert::TryInto;
 use std::error;
 use std::fmt;
+use std::path::Path;
+use std::iter;
 
 #[derive(Debug)]
 pub enum DnsParseError {
@@ -19,24 +24,27 @@ impl fmt::Display for DnsParseError {
                 "Data exceed max length of the field ({}/{})",
                 len, max_len
             ),
-            DnsParseError::UndefinedRecordType(num) => write!(f, "Undefined record type / record class: {}", num),
+            DnsParseError::UndefinedRecordType(num) => {
+                write!(f, "Undefined record type / record class: {}", num)
+            }
             DnsParseError::StreamFormatError => write!(f, "Wrong format in DNS packet"),
         }
     }
 }
 
-impl error::Error for DnsParseError {
-}
+impl error::Error for DnsParseError {}
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum RecordType {
     A,
+    AAAA,
 }
 
 impl RecordType {
     fn value(self) -> u16 {
         match self {
             Self::A => 1,
+            Self::AAAA => 28,
         }
     }
     pub fn serialize<T: BitStore>(self, target_bv: &mut BitVec<T, Msb0>) {
@@ -50,6 +58,10 @@ impl RecordType {
         match u16::from_be_bytes(bytes) {
             1 => {
                 *self = Self::A;
+                Ok(())
+            }
+            28 => {
+                *self = Self::AAAA;
                 Ok(())
             }
             n => Err(DnsParseError::UndefinedRecordType(n)),
@@ -107,11 +119,10 @@ impl TryFrom<u16> for RecordClass {
         }
     }
 }
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub enum DnsName {
     Str(Vec<String>),
-    // Pointer to name label already in buffer.
-    // Compress repeated domain names (or part of it, E.g a.b.com b.com).
+    // TODO: offset should process in serialization phase, DELETE this member
     Offset(u16),
 }
 
@@ -191,6 +202,7 @@ struct Header {
 }
 
 impl Header {
+    const FLAG_RESPONSE: u16 = 0b10000000_00000000;
     pub fn serialize<T: BitStore>(&self, target_bv: &mut BitVec<T, Msb0>) {
         target_bv.extend_from_bitslice(self.id.view_bits::<Msb0>());
         target_bv.extend_from_bitslice(self.flags.view_bits::<Msb0>());
@@ -227,7 +239,7 @@ impl Header {
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 struct Question {
     qname: DnsName,
     qtype: RecordType,
@@ -281,13 +293,21 @@ impl Record {
         }
     }
 
-    pub fn serialize<T: BitStore>(&self, target_bv: &mut BitVec<T, Msb0>) {
+    pub fn serialize<T: BitStore + Default + Clone>(&self, target_bv: &mut BitVec<T, Msb0>) {
         self.rname.serialize(target_bv);
         self.rtype.serialize(target_bv);
         self.rclass.serialize(target_bv);
         target_bv.extend_from_bitslice(self.ttl.view_bits::<Msb0>());
         target_bv.extend_from_bitslice(self.data_length.view_bits::<Msb0>());
         target_bv.extend_from_bitslice(&self.data);
+        // TODO: More elegant way of alignment
+        let gap: i64 = (self.data_length as usize * 8 - self.data.len()).try_into().unwrap();
+        if gap > 0 {
+            let v: Vec<T> = vec![Default::default(); (gap / 8) as usize];
+            target_bv.extend_from_raw_slice(v.as_slice());
+        } else if gap < 0 {
+            panic!("Wrong data length in record")
+        }
     }
 
     fn deserialize<'a, I>(&mut self, mut iter: I) -> Result<(), DnsParseError>
@@ -334,16 +354,19 @@ pub struct Packet {
     authorities: Vec<Record>,
 
     additional: Vec<Record>,
+
+    is_response: bool,
 }
 
 impl Packet {
-    pub fn new() -> Self {
-        Packet {
-            header: Default::default(),
-            questions: Vec::new(),
-            answers: Vec::new(),
-            authorities: Vec::new(),
-            additional: Vec::new(),
+    pub fn new(request: Option<&Packet>) -> Self {
+        match request {
+            Some(req) => Packet {
+                questions: req.questions.clone(),
+                is_response: true,
+                ..Self::default()
+            },
+            None => Self::default(),
         }
     }
 
@@ -358,6 +381,11 @@ impl Packet {
         self.header.answers_count = try_usize_to_u16(self.answers.len())?;
         self.header.authorities_count = try_usize_to_u16(self.authorities.len())?;
         self.header.additional_count = try_usize_to_u16(self.additional.len())?;
+        self.header.flags = if self.is_response {
+            Header::FLAG_RESPONSE
+        } else {
+            0
+        };
         Ok(())
     }
 
@@ -380,8 +408,8 @@ impl Packet {
     {
         let to_modify = [
             (self.header.answers_count, &mut self.answers),
-            (self.header.answers_count, &mut self.authorities),
-            (self.header.answers_count, &mut self.additional),
+            (self.header.authorities_count, &mut self.authorities),
+            (self.header.additional_count, &mut self.additional),
         ];
         self.header.deserialize(&mut iter)?;
         for _ in 0..self.header.questions_count {
@@ -396,13 +424,99 @@ impl Packet {
                 modify.push(a);
             }
         }
+        if self.header.flags & Header::FLAG_RESPONSE == Header::FLAG_RESPONSE {
+            self.is_response = true;
+        }
         Ok(())
+    }
+
+    pub fn embed_data(&mut self, data: &[u8]) -> Result<(), DnsParseError> {
+        // If packet is request, then embed data into prefix of query name
+        // else embed data into ip address of answers(or additional if query is inadequate)
+        if self.is_response {
+            let mut data_iter = data.iter().peekable();
+            // TODO: Alignment
+            for question in &self.questions {
+                let chunk_size: u16 = match question.qtype {
+                    RecordType::A => 4,
+                    RecordType::AAAA => 16,
+                };
+                self.answers.push(Record {
+                    rname: question.qname.clone(),
+                    rtype: question.qtype,
+                    rclass: question.qclass,
+                    // TODO: Random ttl?
+                    ttl: 256,
+                    data_length: chunk_size,
+                    data: (&mut data_iter).take(chunk_size as usize).collect::<BitVec<u8, Msb0>>(),
+                });
+            }
+            while data_iter.peek() != None {
+                self.additional.push(Record {
+                    rname: DnsName::Str(vec![String::from("reply"), String::from("com")]),
+                    rtype: RecordType::AAAA,
+                    rclass: RecordClass::IN,
+                    // TODO: Random ttl?
+                    ttl: 256,
+                    data_length: 16,
+                    data: (&mut data_iter).take(16).collect(),
+                });
+            }
+        } else {
+            // TODO: key path as an argument
+            // TODO: encryption should be moved out
+            for data_chunk in data.chunks(5) {
+                self.questions.push(Question {
+                    qname: DnsName::Str(vec![
+                        BASE32_DNSSEC.encode(data_chunk),
+                        String::from("baidu"),
+                        String::from("com"),
+                    ]),
+                    qtype: RecordType::A,
+                    qclass: RecordClass::IN,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    pub fn extract_data(&mut self) -> Vec<u8> {
+        let mut data = Vec::new();
+        if self.is_response {
+            for answer in &self.answers {
+                data.extend_from_slice(answer.data.as_raw_slice())
+            }
+            for additional in &self.additional {
+                data.extend_from_slice(additional.data.as_raw_slice())
+            }
+        } else {
+            for q in &self.questions {
+                let data_str = match &q.qname {
+                    DnsName::Str(str) => str,
+                    DnsName::Offset(_) => panic!("Embeded data can't use offset"),
+                };
+                data.append(
+                    &mut BASE32_DNSSEC
+                        .decode(data_str[0].as_bytes())
+                        .expect("Error decoding"),
+                );
+            }
+        }
+        data
     }
 }
 
 impl Default for Packet {
     fn default() -> Self {
-        Self::new()
+        Packet {
+            header: Default::default(),
+            questions: Vec::new(),
+            answers: Vec::new(),
+            authorities: Vec::new(),
+            additional: Vec::new(),
+
+            is_response: false
+        }
     }
 }
 
@@ -434,7 +548,7 @@ fn check_request() -> Result<(), Box<dyn error::Error>> {
 
     // let dest = SocketAddrV4::from_str("127.0.0.1:53").unwrap();
     // socket.send_to(buf.as_raw_slice(), dest)?;
-    let mut p_check = Packet::new();
+    let mut p_check = Packet::new(None);
     p_check.deserialize(buf.iter())?;
     assert_eq!(p_check, p);
     Ok(())
@@ -442,6 +556,5 @@ fn check_request() -> Result<(), Box<dyn error::Error>> {
 
 #[test]
 fn check_response() -> Result<(), Box<dyn error::Error>> {
-
     Ok(())
 }
