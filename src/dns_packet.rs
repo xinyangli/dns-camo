@@ -1,6 +1,7 @@
 use crate::payload::Payload;
 use bitvec::prelude::*;
 use data_encoding::BASE32_DNSSEC;
+use std::borrow::BorrowMut;
 use std::collections::btree_map::Iter;
 use std::convert::TryInto;
 use std::error;
@@ -336,9 +337,6 @@ impl Record {
                 .map_err(|_| DnsParseError::StreamFormatError)?,
         );
         self.data = (&mut iter).take(self.data_length as usize).collect();
-        if self.data.len() != self.data_length as usize {
-            return Err(DnsParseError::StreamFormatError);
-        }
         Ok(())
     }
 }
@@ -359,14 +357,10 @@ pub struct Packet {
 }
 
 impl Packet {
-    pub fn new(request: Option<&Packet>) -> Self {
-        match request {
-            Some(req) => Packet {
-                questions: req.questions.clone(),
-                is_response: true,
-                ..Self::default()
-            },
-            None => Self::default(),
+    pub fn new(is_response: bool) -> Self {
+        Packet {
+            is_response: is_response,
+            ..Self::default()
         }
     }
 
@@ -406,12 +400,12 @@ impl Packet {
     where
         I: Iterator<Item = &'a u8>,
     {
+        self.header.deserialize(&mut iter)?;
         let to_modify = [
             (self.header.answers_count, &mut self.answers),
             (self.header.authorities_count, &mut self.authorities),
             (self.header.additional_count, &mut self.additional),
         ];
-        self.header.deserialize(&mut iter)?;
         for _ in 0..self.header.questions_count {
             let mut q = Question::new();
             q.deserialize(&mut iter)?;
@@ -430,10 +424,18 @@ impl Packet {
         Ok(())
     }
 
-    pub fn embed_data(&mut self, data: &[u8]) -> Result<(), DnsParseError> {
+    pub fn embed_data(&mut self, data: &[u8], request: Option<&Packet>) -> Result<(), DnsParseError> {
         // If packet is request, then embed data into prefix of query name
         // else embed data into ip address of answers(or additional if query is inadequate)
         if self.is_response {
+            match request {
+                Some(req) => {
+                    self.questions = req.questions.clone();
+                },
+                None => {
+                    panic!("request not provided for response message!")
+                }
+            };
             let mut data_iter = data.iter().peekable();
             // TODO: Alignment
             for question in &self.questions {
@@ -463,8 +465,6 @@ impl Packet {
                 });
             }
         } else {
-            // TODO: key path as an argument
-            // TODO: encryption should be moved out
             for data_chunk in data.chunks(5) {
                 self.questions.push(Question {
                     qname: DnsName::Str(vec![
@@ -526,7 +526,6 @@ use std::str::FromStr;
 
 #[test]
 fn check_request() -> Result<(), Box<dyn error::Error>> {
-    let socket = UdpSocket::bind("127.0.0.1:34254")?;
     let mut p = Packet {
         questions: vec![Question {
             qname: DnsName::from_str("abc.xyz.com").unwrap(),
@@ -548,7 +547,7 @@ fn check_request() -> Result<(), Box<dyn error::Error>> {
 
     // let dest = SocketAddrV4::from_str("127.0.0.1:53").unwrap();
     // socket.send_to(buf.as_raw_slice(), dest)?;
-    let mut p_check = Packet::new(None);
+    let mut p_check = Packet::new(false);
     p_check.deserialize(buf.iter())?;
     assert_eq!(p_check, p);
     Ok(())
