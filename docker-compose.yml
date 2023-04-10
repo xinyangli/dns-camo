@@ -1,0 +1,31 @@
+---
+version: "3"
+services:
+  client:
+    build:
+      context: .
+      target: client
+    networks:
+      dns_camo:
+        ipv4_address: 172.16.238.10
+    deploy:
+      restart_policy:
+        condition: any
+        delay: 10s
+
+  server:
+    restart: on-failure
+    stop_grace_period: 2s
+    build:
+      context: .
+      target: server
+    networks:
+      dns_camo:
+        ipv4_address: 172.16.238.11
+
+networks:
+  dns_camo:
+    ipam:
+      driver: default
+      config:
+        - subnet: "172.16.238.0/24"
